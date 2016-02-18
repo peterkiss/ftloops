@@ -119,7 +119,7 @@ public abstract class StreamTask<OUT, Operator extends StreamOperator<OUT>>
 	protected Operator headOperator;
 
 	/** The chain of operators executed by this task */
-	private OperatorChain<OUT> operatorChain;
+	protected OperatorChain<OUT> operatorChain;
 	
 	/** The configuration of this streaming task */
 	private StreamConfig configuration;
@@ -450,6 +450,105 @@ public abstract class StreamTask<OUT, Operator extends StreamOperator<OUT>>
 		}
 	}
 
+	/**
+	 * Checkpoints all operator states of the current StreamTask. 
+	 * Thread-safety must be handled outside the scope of this function
+	 */
+	protected boolean checkpointStatesInternal(final long checkpointId, long timestamp) throws Exception {
+		final StreamOperator<?>[] allOperators = operatorChain.getAllOperators();
+		final StreamTaskState[] states = new StreamTaskState[allOperators.length];
+
+		boolean hasAsyncStates = false;
+
+		for (int i = 0; i < states.length; i++) {
+			StreamOperator<?> operator = allOperators[i];
+			if (operator != null) {
+				StreamTaskState state = operator.snapshotOperatorState(checkpointId, timestamp);
+				if (state.getOperatorState() instanceof AsynchronousStateHandle) {
+					hasAsyncStates = true;
+				}
+				if (state.getFunctionState() instanceof AsynchronousStateHandle) {
+					hasAsyncStates = true;
+				}
+				if (state.getKvStates() != null) {
+					for (KvStateSnapshot<?, ?, ?, ?, ?> kvSnapshot: state.getKvStates().values()) {
+						if (kvSnapshot instanceof AsynchronousKvStateSnapshot) {
+							hasAsyncStates = true;
+						}
+					}
+				}
+
+				states[i] = state.isEmpty() ? null : state;
+			}
+		}
+
+		if (!isRunning) {
+			// Rethrow the cancel exception because some state backends could swallow
+			// exceptions and seem to exit cleanly.
+			throw new CancelTaskException();
+		}
+
+		StreamTaskStateList allStates = new StreamTaskStateList(states);
+
+		if (allStates.isEmpty()) {
+			getEnvironment().acknowledgeCheckpoint(checkpointId);
+		} else if (!hasAsyncStates) {
+			getEnvironment().acknowledgeCheckpoint(checkpointId, allStates);
+		} else {
+			// start a Thread that does the asynchronous materialization and
+			// then sends the checkpoint acknowledge
+
+			String threadName = "Materialize checkpoint state " + checkpointId + " - " + getName();
+			Thread checkpointThread = new Thread(threadName) {
+				@Override
+				public void run() {
+					try {
+						for (StreamTaskState state : states) {
+							if (state != null) {
+								if (state.getFunctionState() instanceof AsynchronousStateHandle) {
+									AsynchronousStateHandle<Serializable> asyncState = (AsynchronousStateHandle<Serializable>) state.getFunctionState();
+									state.setFunctionState(asyncState.materialize());
+								}
+								if (state.getOperatorState() instanceof AsynchronousStateHandle) {
+									AsynchronousStateHandle<?> asyncState = (AsynchronousStateHandle<?>) state.getOperatorState();
+									state.setOperatorState(asyncState.materialize());
+								}
+								if (state.getKvStates() != null) {
+									Set<String> keys = state.getKvStates().keySet();
+									HashMap<String, KvStateSnapshot<?, ?, ?, ?, ?>> kvStates = state.getKvStates();
+									for (String key: keys) {
+										if (kvStates.get(key) instanceof AsynchronousKvStateSnapshot) {
+											AsynchronousKvStateSnapshot<?, ?, ?, ?, ?> asyncHandle = (AsynchronousKvStateSnapshot<?, ?, ?, ?, ?>) kvStates.get(key);
+											kvStates.put(key, asyncHandle.materialize());
+										}
+									}
+								}
+
+							}
+						}
+						StreamTaskStateList allStates = new StreamTaskStateList(states);
+						getEnvironment().acknowledgeCheckpoint(checkpointId, allStates);
+						LOG.debug("Finished asynchronous checkpoints for checkpoint {} on task {}", checkpointId, getName());
+					}
+					catch (Exception e) {
+						if (isRunning()) {
+							LOG.error("Caught exception while materializing asynchronous checkpoints.", e);
+						}
+						if (asyncException == null) {
+							asyncException = new AsynchronousException(e);
+						}
+					}
+					asyncCheckpointThreads.remove(this);
+				}
+			};
+
+			asyncCheckpointThreads.add(checkpointThread);
+			checkpointThread.setDaemon(true);
+			checkpointThread.start();
+		}
+		return true;
+	}
+
 	@Override
 	public boolean triggerCheckpoint(final long checkpointId, final long timestamp) throws Exception {
 		LOG.debug("Starting checkpoint {} on task {}", checkpointId, getName());
@@ -464,98 +563,8 @@ public abstract class StreamTask<OUT, Operator extends StreamOperator<OUT>>
 				operatorChain.broadcastCheckpointBarrier(checkpointId, timestamp);
 				
 				// now draw the state snapshot
-				final StreamOperator<?>[] allOperators = operatorChain.getAllOperators();
-				final StreamTaskState[] states = new StreamTaskState[allOperators.length];
-
-				boolean hasAsyncStates = false;
-
-				for (int i = 0; i < states.length; i++) {
-					StreamOperator<?> operator = allOperators[i];
-					if (operator != null) {
-						StreamTaskState state = operator.snapshotOperatorState(checkpointId, timestamp);
-						if (state.getOperatorState() instanceof AsynchronousStateHandle) {
-							hasAsyncStates = true;
-						}
-						if (state.getFunctionState() instanceof AsynchronousStateHandle) {
-							hasAsyncStates = true;
-						}
-						if (state.getKvStates() != null) {
-							for (KvStateSnapshot<?, ?, ?, ?, ?> kvSnapshot: state.getKvStates().values()) {
-								if (kvSnapshot instanceof AsynchronousKvStateSnapshot) {
-									hasAsyncStates = true;
-								}
-							}
-						}
-
-						states[i] = state.isEmpty() ? null : state;
-					}
-				}
-
-				if (!isRunning) {
-					// Rethrow the cancel exception because some state backends could swallow
-					// exceptions and seem to exit cleanly.
-					throw new CancelTaskException();
-				}
-
-				StreamTaskStateList allStates = new StreamTaskStateList(states);
-
-				if (allStates.isEmpty()) {
-					getEnvironment().acknowledgeCheckpoint(checkpointId);
-				} else if (!hasAsyncStates) {
-					getEnvironment().acknowledgeCheckpoint(checkpointId, allStates);
-				} else {
-					// start a Thread that does the asynchronous materialization and
-					// then sends the checkpoint acknowledge
-
-					String threadName = "Materialize checkpoint state " + checkpointId + " - " + getName();
-					Thread checkpointThread = new Thread(threadName) {
-						@Override
-						public void run() {
-							try {
-								for (StreamTaskState state : states) {
-									if (state != null) {
-										if (state.getFunctionState() instanceof AsynchronousStateHandle) {
-											AsynchronousStateHandle<Serializable> asyncState = (AsynchronousStateHandle<Serializable>) state.getFunctionState();
-											state.setFunctionState(asyncState.materialize());
-										}
-										if (state.getOperatorState() instanceof AsynchronousStateHandle) {
-											AsynchronousStateHandle<?> asyncState = (AsynchronousStateHandle<?>) state.getOperatorState();
-											state.setOperatorState(asyncState.materialize());
-										}
-										if (state.getKvStates() != null) {
-											Set<String> keys = state.getKvStates().keySet();
-											HashMap<String, KvStateSnapshot<?, ?, ?, ?, ?>> kvStates = state.getKvStates();
-											for (String key: keys) {
-												if (kvStates.get(key) instanceof AsynchronousKvStateSnapshot) {
-													AsynchronousKvStateSnapshot<?, ?, ?, ?, ?> asyncHandle = (AsynchronousKvStateSnapshot<?, ?, ?, ?, ?>) kvStates.get(key);
-													kvStates.put(key, asyncHandle.materialize());
-												}
-											}
-										}
-
-									}
-								}
-								StreamTaskStateList allStates = new StreamTaskStateList(states);
-								getEnvironment().acknowledgeCheckpoint(checkpointId, allStates);
-								LOG.debug("Finished asynchronous checkpoints for checkpoint {} on task {}", checkpointId, getName());
-							}
-							catch (Exception e) {
-								if (isRunning()) {
-									LOG.error("Caught exception while materializing asynchronous checkpoints.", e);
-								}
-								if (asyncException == null) {
-									asyncException = new AsynchronousException(e);
-								}
-							}
-							asyncCheckpointThreads.remove(this);
-						}
-					};
-
-					asyncCheckpointThreads.add(checkpointThread);
-					checkpointThread.setDaemon(true);
-					checkpointThread.start();
-				}
-				return true;
+				return checkpointStatesInternal(checkpointId, timestamp);
+				
 			} else {
 				return false;
 			}

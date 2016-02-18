@@ -43,32 +43,25 @@ import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertTrue;
 
 /**
- * FIXME
- * A simple test that runs a streaming topology with checkpointing enabled.
+ * An integration test that runs an iterative streaming topology with checkpointing enabled.
  * <p/>
- * The test triggers a failure after a while and verifies that, after completion, the
- * state defined with the {@link Checkpointed} interface reflects the "exactly once" semantics.
+ * The test triggers a failure after a while and verifies "exactly-once-processing" guarantees.
+ * 
+ * The correctness of the final state relies on whether all records in transit through the iteration cycle
+ * have been processed exactly once by the stateful operator that consumes the feedback stream.
+ * 
  */
 @SuppressWarnings("serial")
 public class StreamIterationCheckpointingITCase extends StreamFaultToleranceTestBase {
 
-	final long NUM_ADDITIONS = 1_000_000L;
+	final long NUM_ADDITIONS = 600_000L;
 
-	/**
-	 * FIXME
-	 * Runs the following program:
-	 * <p/>
-	 * <pre>
-	 *     [ (source)->(filter) ]-s->[ (map) ] -> [ (map) ] -> [ (groupBy/count)->(sink) ]
-	 * </pre>
-	 */
 	@Override
 	public void testProgram(StreamExecutionEnvironment env) {
-		env.setNumberOfExecutionRetries(2);
 		DataStream<ADD> stream = env.addSource(new AddGenerator(NUM_ADDITIONS));
 
-		IterativeStream.ConnectedIterativeStreams<ADD, SUBTRACT> iter = stream.iterate(2500).withFeedbackType(SUBTRACT.class);
-		SplitStream<Tuple2<String, Long>> step = iter.flatMap(new LoopCounter()).split(new OutputSelector<Tuple2<String, Long>>() {
+		IterativeStream.ConnectedIterativeStreams<ADD, SUBTRACT> iter = stream.iterate(2000).withFeedbackType(SUBTRACT.class);
+		SplitStream<Tuple2<String, Long>> step = iter.flatMap(new LoopCounter()).disableChaining().split(new OutputSelector<Tuple2<String, Long>>() {
 			@Override
 			public Iterable<String> select(Tuple2<String, Long> value) {
 				return Lists.newArrayList(value.f0);
@@ -85,14 +78,7 @@ public class StreamIterationCheckpointingITCase extends StreamFaultToleranceTest
 			public Long map(Tuple2<String, Long> value) throws Exception {
 				return value.f1;
 			}
-		}).addSink(new OnceFailingSink(NUM_ADDITIONS));
-
-//		stream.map(new MapFunction<ADD, Long>() {
-//			@Override
-//			public Long map(ADD value) throws Exception {
-//				return 1l;
-//			}
-//		}).addSink(new OnceFailingSink(NUM_ADDITIONS));
+		}).disableChaining().addSink(new OnceFailingSink(NUM_ADDITIONS));
 
 	}
 
@@ -172,8 +158,8 @@ public class StreamIterationCheckpointingITCase extends StreamFaultToleranceTest
 
 		public static final String FEEDBACK = "FEEDBACK";
 		public static final String FORWARD = "FORWARD";
-		private long state;
 		static final long[] stateVals = new long[PARALLELISM];
+		private long state;
 		private int index;
 
 		@Override
