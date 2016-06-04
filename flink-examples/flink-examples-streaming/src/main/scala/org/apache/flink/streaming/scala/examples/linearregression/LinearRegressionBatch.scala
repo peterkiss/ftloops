@@ -16,8 +16,11 @@
  * limitations under the License.
  */
 
-package org.apache.flink.examples.scala.ml
+package org.apache.flink.streaming.scala.examples.linearregression
 
+import java.util.logging.{Logger, SimpleFormatter, FileHandler}
+
+//import _root_.LinearRegressionScala._
 import org.apache.flink.api.common.functions._
 import org.apache.flink.api.scala._
 import org.apache.flink.configuration.Configuration
@@ -58,8 +61,8 @@ import scala.collection.JavaConverters._
  *  - Bulk iterations
  *  - Broadcast variables in bulk iterations
  */
-object LinearRegression {
-
+object LinearRegressionBatch {
+  protected val LOG: Logger = Logger.getLogger(getClass.getName)
   /*def countBatchParams(args: Array[String]) : Params  = {
    /* if (!parseParameters(args)) {
       return
@@ -93,7 +96,13 @@ object LinearRegression {
     if (!parseParameters(args)) {
       return
     }
+    val fh = new FileHandler("/home/kiss/log/batch.log")
+    LOG.addHandler(fh);
+    val formatter = new SimpleFormatter();
+    fh.setFormatter(formatter);
 
+    // the following statement is used to log any messages
+    LOG.info("Linear regression - batch algorithm");
     val env = ExecutionEnvironment.getExecutionEnvironment
     val data = getDataSet(env)
     val parameters = getParamsDataSet(env)
@@ -106,6 +115,7 @@ object LinearRegression {
           (result, p1._2 + p2._2)
         }
         .map { x => x._1.div(x._2) }
+      //LOG.info()
       newParameters
     }
 

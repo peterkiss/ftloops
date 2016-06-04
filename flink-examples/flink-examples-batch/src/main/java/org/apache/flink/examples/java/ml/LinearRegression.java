@@ -220,14 +220,15 @@ public class LinearRegression {
 
 		@Override
 		public Tuple2<Params, Integer> map(Data in) throws Exception {
-
+			//int i = 0;
 			for(Params p : parameters){
-				this.parameter = p; 
-			}
+				this.parameter = p;
+				//System.out.println("parametercounter"+ i++);
+		 }
 
 			double theta_0 = parameter.theta0 - 0.01*((parameter.theta0 + (parameter.theta1*in.x)) - in.y);
 			double theta_1 = parameter.theta1 - 0.01*(((parameter.theta0 + (parameter.theta1*in.x)) - in.y) * in.x);
-
+			//System.out.println("Count for PARAM   :"+count);
 			return new Tuple2<Params,Integer>(new Params(theta_0,theta_1),count);
 		}
 	}
@@ -255,8 +256,9 @@ public class LinearRegression {
 
 		@Override
 		public Params map(Tuple2<Params, Integer> arg0) throws Exception {
-
-			return arg0.f0.div(arg0.f1);
+     		Params p = arg0.f0.div(arg0.f1);
+			System.out.println("UPdate param : "+ p.getTheta0()+" "+p.getTheta1());
+			return p;
 
 		}
 
@@ -268,7 +270,7 @@ public class LinearRegression {
 	private static boolean fileOutput = false;
 	private static String dataPath = null;
 	private static String outputPath = null;
-	private static int numIterations = 10;
+	private static int numIterations = 1000;
 
 	private static boolean parseParameters(String[] programArguments) {
 
